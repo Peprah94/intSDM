@@ -433,7 +433,7 @@ species_model <- R6::R6Class(classname = 'species_model', public = list(
       meshArgs <- list(...)
       if (length(meshArgs) == 0) stop('Please provide ... to specify the mesh construction. See ?inla.mesh.2d for more details.')
 
-      meshObj <- INLA::inla.mesh.2d(boundary = inlabru::fm_as_inla_mesh_segment(private$Area[1]),
+      meshObj <- INLA::inla.mesh.2d(boundary = fmesher::fm_as_segm(private$Area[1]),
                                     crs = inlabru::fm_crs(private$Projection),
                                          ...
                                           )
@@ -444,7 +444,7 @@ species_model <- R6::R6Class(classname = 'species_model', public = list(
     else {
 
       if (!inherits(Object, 'inla.mesh')) stop('Object provided is not an inla.mesh object.')
-
+#Ensure CRS is the same
       private$Mesh <- Object
 
     }
@@ -810,8 +810,9 @@ addGBIF = function(Species = 'All', datasetName = NULL,
 
 #' @description Function to specify model options for the \code{INLA} and \code{PointedSDMs} parts of the model.
 #' @param ISDM Arguments to specify in \link[PointedSDMs]{intModel} from the \code{PointedSDMs} function. This argument needs to be a named list of the following options: \code{pointCovariates}, \code{pointsIntercept}, \code{pointsSpatial} or \code{copyModel}. See \code{?intModel} for more details.
-#' @param INLA Options to specify in \link[INLA]{INLA} from the \code{inla} function. See \code{?inla} for more details.
-#' @param Richness Options to specify the richness model. This argument needs to be a named list of the following options: \code{predictionIntercept}.
+#' @param Ipoints Options to specify in \link[inlabru]{fm_int}'s \code{int.args} argument. See \code{?fmesher::fm_int} for more details.
+#' @param INLA Options to specify in \link[INLA]{inla} from the \code{inla} function. See \code{?inla} for more details.
+#' @param Richness Options to specify the richness model. This argument needs to be a named list of the following options: \code{predictionIntercept}, \code{samplingSize} and \code{speciesSpatial}.
 #' @examples
 #' workflow <- startWorkflow(Species = 'Fraxinus excelsior',
 #'                           Projection = '+proj=longlat +ellps=WGS84',
@@ -821,6 +822,7 @@ addGBIF = function(Species = 'All', datasetName = NULL,
 #' workflow$modelOptions(INLA = list(control.inla=list(int.strategy = 'eb')),
 #'                       ISDM = list(pointsIntercept = FALSE))
   modelOptions = function(ISDM = list(),
+                          Ipoints = list(),
                           INLA = list(),
                           Richness = list()) {
 
@@ -829,7 +831,7 @@ addGBIF = function(Species = 'All', datasetName = NULL,
     if (any(!names(ISDM) %in% c('pointCovariates', 'pointsIntercept', #Remove pointCovariates perhaps?
                                 'pointsSpatial', 'copyModel'))) stop('ISDM needs to be a named list with at least one of the following options: "pointCovariates", "pointsIntercept", "pointsSpatial" or "copyModel".')
 
-    if (any(!names(Richness) %in% c('predictionIntercept'))) stop('Richness needs to be a named list with at least one of the following options: "predictionIntercept".')
+    if (any(!names(Richness) %in% c('predictionIntercept', 'speciesSpatial', 'samplingSize'))) stop('Richness needs to be a named list with at least one of the following options: "predictionIntercept".')
 
     if ('predictionIntercept' %in% names(Richness)) {
 
@@ -839,9 +841,20 @@ addGBIF = function(Species = 'All', datasetName = NULL,
 
     }
 
+    if ('samplingSize' %in% names(Richness)) private$samplingSize <- Richness[['samplingSize']]
+
+    if (!'speciesSpatial' %in% names(Richness)) Richness[['speciesSpatial']] <- 'shared'
+    else
+      if (!Richness[['speciesSpatial']] %in% c('shared', 'replicate', 'copy') && !is.null(Richness[['speciesSpatial']])) stop ('speciesSpatial must be either: NULL, "replicate", "copy" or "shared.')
+
     if (!is.list(INLA)) stop('INLA needs to be a list of INLA arguments to specify the model.')
 
+    if (!is.list(Ipoints)) stop('Ipoints needs to be a list of integration point arguments.')
+
+    if (!all(names(Ipoints) %in% c('method', 'nsub1', 'nsub2'))) stop('IPoints needs to be a named list with at least one of the following options: "method", "nsub1", "nsub2"')
+
     if (length(ISDM) > 0) private$optionsISDM <- ISDM
+    if (length(Ipoints) > 0) private$optionsIpoints <- Ipoints
     if (length(INLA) > 0) private$optionsINLA <- INLA
     if (length(Richness) > 0) private$optionsRichness <- Richness
 
@@ -879,7 +892,54 @@ addGBIF = function(Species = 'All', datasetName = NULL,
 
   }
   ,
+#' @description Function to specify priors for the fixed effects in the model. The priors of the fixed effects are assumed to be Gaussian; this function alows the user to specify the parameters of this distribution.
+#' @param effectNames The name of the effects to specify the prior for. Must be the name of any of the covariates incldued in the model, or 'Intercept' to specify the priors for the intercept terms.
+#' @param Mean The mean of the prior distribution. Defaults to \code{0}.
+#' @param Precision The precision (inverse variance) of the prior distribution. Defaults to \code{0.01}.
+#' @param priorIntercept Prior for the precision parameter for the random intercept in the species richness model. Needs \code{workflowOutput = "Richness"}. Defaults to the default \textit{INLA} prior.
+#' @param priorGroup Prior for the precision for the \textit{iid} effect in the species spatial effect in the richness model. Needs \code{workflowOutput = "Richness"} and \code{speciesSpatial = "replicate"} in the richness options. Defualts to the default \textit{INLA} prior.
+#
+#' @examples
+#' \dontrun{
+#' if (requireNamespace('INLA')) {
+#' workflow <- startWorkflow(Species = 'Fraxinus excelsior',
+#'                           Projection = '+proj=longlat +ellps=WGS84',
+#'                           Save = FALSE,
+#'                           saveOptions = list(projectName = 'example'))
+#'
+#' #Add boundary
+#' workflow$addArea(countryName = 'Sweden')
+#' workflow$addMesh(cutoff = 20000,
+#'                  max.edge=c(60000, 80000),
+#'                  offset= 100000)
+#' workflow$specifyPriors(effectName = 'Intercept', mean = 0, Precision = 0.1)
+#' }
+#' }
+specifyPriors = function(effectNames, Mean = 0, Precision = 0.01,
+                         priorIntercept = list(prior="loggamma", param = c(1, 5e-5)),
+                         priorGroup = list(prior = "loggamma", param = c(1, 5e-5))) {
 
+  if (!missing(effectNames)) {
+
+  if (!all(effectNames %in% c('Intercept', unlist(lapply(private$Covariates, names))))) stop('effectNames must be the names of the effects added with .$addCovariates or "Intercept".')
+
+  for (effect in effectNames) {
+
+    private$priorsFixed[[effect]] <- c(Mean = Mean, Prec = Precision)
+
+  }
+
+  }
+
+  private$priorIntercept <- deparse1(priorIntercept)
+  private$priorGroup <- deparse1(priorGroup)
+
+  ##Something here for the random effects prior for the random iid model
+
+
+
+}
+,
 #' @description Function to add bias fields to the model.
 #' @param datasetName Name of the dataset to add a bias field to.
 #' @param copyModel Create copies of the biasField across the different datasets. Defaults to \code{FALSE}.
@@ -936,6 +996,53 @@ addGBIF = function(Species = 'All', datasetName = NULL,
 
   }
   ,
+#' @description Function to add bias covariates to the model.
+#' @param datasetName Name of the dataset to add the covariate to.
+#' @param Covariate A \code{spatRaster} layer to account for sampling bias.
+#' @examples
+#' \dontrun{
+#' if(requireNamespace('INLA')) {
+#'
+#' workflow <- startWorkflow(Species = 'Fraxinus excelsior',
+#'                           Projection = '+proj=longlat +ellps=WGS84',
+#'                           Save = FALSE,
+#'                           saveOptions = list(projectName = 'example'))
+#' workflow$addArea(countryName = 'Sweden')
+#'
+#' workflow$addGBIF(datasetName = 'exampleGBIF',
+#'                  datasetType = 'PA',
+#'                  limit = 10000,
+#'                  coordinateUncertaintyInMeters = '0,50')
+#' #workflow$biasCovariate(datasetName = 'exampleGBIF', Covariate = distance_to_road)
+#' }
+#' }
+
+biasCovariate = function(datasetName,
+                         Covariate) {
+
+  if (!all(datasetName %in% private$datasetName)) stop('Dataset specified for bias covariate not included in the workflow.')
+
+  if (!inherits(Covariate, 'SpatRaster')) stop('The covariate layer must be a spatRaster object.')
+
+  Covariate <- terra::project(Covariate, private$Projection)
+
+  #if (length(names(Object)) > 1) stop('Please provide each covariate into the workflow as their own object.')
+
+  for (cov in names(Covariate)) {
+
+    #Check this for all classes
+    maskedDF <- terra::crop(terra::mask(Covariate[cov][[1]], private$Area), private$Area)
+
+    if (all(is.na(terra::values(maskedDF)))) stop('The covariate provided and the area specified do not match.')
+
+    private$biasCovariates[[cov]] <- Covariate[cov]
+
+  }
+
+  private$biasCovNames <- unique(c(datasetName, private$biasCovNames))
+
+
+},
 
 #' @description Function to specify the workflow output from the model. This argument must be at least one of: \code{'Model'}, \code{'Prediction'}, \code{'Richness'}, \code{'Maps'} and \code{'Cross-validation'}.
 #' @param Output The names of the outputs to give in the workflow. Must be at least one of: \code{'Model'}, \code{'Prediction'}, \code{'Richness'}, \code{'Maps'}, \code{'Bias'} and \code{'Cross-validation'}.
@@ -957,6 +1064,25 @@ addGBIF = function(Species = 'All', datasetName = NULL,
     private$Output <- Output
 
   }
+  ,
+#' @description Add a formula to the model
+#' @param covariateFormula Change the covariate formula of the model.
+#' @param biasFormula Change the bias formula of the model
+#' @examples
+#'
+#'
+#'
+
+modelFormula = function(covariateFormula, biasFormula) {
+
+  if (!missing(covariateFormula)) private$covariateFormula <- covariateFormula
+
+  #Check if all variables in here are in the covariates
+
+  if (!missing(biasFormula)) private$biasFormula <- biasFormula
+
+
+}
   ,
 
 #' @description Obtain metadata from the workflow.
@@ -1043,11 +1169,13 @@ obtainMeta = function(Number = TRUE,
   ))
 
 species_model$set('private', 'Area', NULL)
-species_model$set('private', 'Covariates', NULL)
+species_model$set('private', 'Covariates', list())
+species_model$set('private', 'biasCovariates', list())
 species_model$set('private', 'Mesh', NULL)
 species_model$set('private', 'optionsISDM', list())
 species_model$set('private', 'optionsINLA', list())
 species_model$set('private', 'optionsRichness', list())
+species_model$set('private', 'optionsIpoints', list())
 species_model$set('private', 'CVMethod', NULL)
 species_model$set('private', 'Species', NULL)
 species_model$set('private', 'Countries', NULL)
@@ -1067,8 +1195,15 @@ species_model$set('private', 'biasFieldsSpecify', list())
 species_model$set('private', 'datasetName', NULL)
 species_model$set('private', 'Save', TRUE)
 species_model$set('private', 'biasNames', NULL)
+species_model$set('private', 'biasCovNames', NULL)
 species_model$set('private', 'blockOptions', list())
 species_model$set('private', 'classGBIF', list())
+species_model$set('private', 'priorsFixed', list())
+species_model$set('private', 'priorGroup', deparse1(list(prior="loggamma", param = c(1, 5e-5))))
+species_model$set('private', 'priorIntercept', deparse1(list(prior="loggamma", param = c(1, 5e-5))))
+species_model$set('private', 'samplingSize', NULL)
+species_model$set('private', 'covariateFormula', NULL)
+species_model$set('private', 'biasFormula', NULL)
 
 
 
